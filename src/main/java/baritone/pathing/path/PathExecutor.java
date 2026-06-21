@@ -70,6 +70,7 @@ public class PathExecutor implements IPathExecutor, Helper {
     private HashSet<BlockPos> toBreak = new HashSet<>();
     private HashSet<BlockPos> toPlace = new HashSet<>();
     private HashSet<BlockPos> toWalkInto = new HashSet<>();
+    private BlockStateInterface tickBsi;
 
     private final PathingBehavior behavior;
     private final IPlayerContext ctx;
@@ -143,7 +144,10 @@ public class PathExecutor implements IPathExecutor, Helper {
             return false;
         }
         //long start = System.nanoTime() / 1000000L;
-        BlockStateInterface bsi = new BlockStateInterface(ctx);
+        if (tickBsi == null) {
+            tickBsi = new BlockStateInterface(ctx);
+        }
+        BlockStateInterface bsi = tickBsi;
         for (int i = pathPosition - 10; i < pathPosition + 10; i++) {
             if (i < 0 || i >= path.movements().size()) {
                 continue;
@@ -592,6 +596,7 @@ public class PathExecutor implements IPathExecutor, Helper {
         behavior.baritone.getInputOverrideHandler().getBlockBreakHelper().stopBreakingBlock();
         pathPosition = path.length() + 3;
         failed = true;
+        tickBsi = null;
     }
 
     @Override

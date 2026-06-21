@@ -31,7 +31,7 @@ public final class BinaryHeapOpenSet implements IOpenSet {
     /**
      * The initial capacity of the heap (2^10)
      */
-    private static final int INITIAL_CAPACITY = 1024;
+    private static final int INITIAL_CAPACITY = 4096;
 
     /**
      * The array backing the heap

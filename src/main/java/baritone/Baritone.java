@@ -31,6 +31,7 @@ import baritone.command.manager.CommandManager;
 import baritone.event.GameEventHandler;
 import baritone.process.*;
 import baritone.selection.SelectionManager;
+import baritone.pathing.precompute.PrecomputedData;
 import baritone.utils.BlockStateInterface;
 import baritone.utils.GuiClick;
 import baritone.utils.InputOverrideHandler;
@@ -89,6 +90,7 @@ public class Baritone implements IBaritone {
     private final WorldProvider worldProvider;
 
     public BlockStateInterface bsi;
+    public final PrecomputedData sharedPrecomputedData = new PrecomputedData();
 
     Baritone(Minecraft mc) {
         this.mc = mc;

@@ -89,7 +89,7 @@ public class CalculationContext {
     }
 
     public CalculationContext(IBaritone baritone, boolean forUseOnAnotherThread) {
-        this.precomputedData = new PrecomputedData();
+        this.precomputedData = ((Baritone) baritone).sharedPrecomputedData;
         this.safeForThreadedUse = forUseOnAnotherThread;
         this.baritone = baritone;
         LocalPlayer player = baritone.getPlayerContext().player();
