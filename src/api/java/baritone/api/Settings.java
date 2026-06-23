@@ -707,6 +707,11 @@ public final class Settings {
     public final Setting<Boolean> renderGetProcessHud = new Setting<>(true);
 
     /**
+     * Print GetProcess planning, crafting, smelting, and material selection decisions to chat
+     */
+    public final Setting<Boolean> getDebug = new Setting<>(false);
+
+    /**
      * Render the path as a line instead of a frickin thingy
      */
     public final Setting<Boolean> renderPathAsLine = new Setting<>(false);

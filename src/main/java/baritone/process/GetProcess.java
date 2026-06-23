@@ -22,6 +22,8 @@ import baritone.api.process.IGetProcess;
 import baritone.api.process.PathingCommand;
 import baritone.api.process.PathingCommandType;
 import baritone.api.utils.BlockOptionalMeta;
+import baritone.api.utils.BlockOptionalMetaLookup;
+import baritone.pathing.movement.CalculationContext;
 import baritone.utils.BaritoneProcessHelper;
 import baritone.utils.schematic.StaticSchematic;
 import net.minecraft.client.gui.screens.inventory.AbstractContainerScreen;
@@ -71,6 +73,9 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
     private static final int CRAFTING_TABLE_SCAN_HORIZONTAL = 32;
     private static final int CRAFTING_TABLE_SCAN_VERTICAL = 8;
     private static final int WORKSTATION_OPEN_MAX_ATTEMPTS = 3;
+    private static final int WORKSTATION_RECLAIM_DISTANCE = 24;
+    private static final int SMELT_REOPEN_BUFFER_TICKS = 30;
+    private static final double UNKNOWN_SOURCE_DISTANCE = Double.MAX_VALUE;
 
     private final List<GetTarget> targets = new ArrayList<>();
     private int targetIndex;
@@ -81,18 +86,25 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
     private SmeltAction smeltAction;
     private SubAction subAction = SubAction.NONE;
     private Item miningItem;
+    private int miningDesired;
     private Item pickupItem;
     private int pickupDesired;
     private int pickupTicks;
     private Block workstationBlock;
     private BlockPos workstationPos;
     private int workstationOpenAttempts;
+    private TemporaryWorkstation reclaimingWorkstation;
+    private int reclaimingDesired;
+    private final List<TemporaryWorkstation> temporaryWorkstations = new ArrayList<>();
     private final Map<Item, List<Block>> mineSourceCache = new HashMap<>();
     private final Map<Item, Boolean> mineDropSourceCache = new HashMap<>();
     private List<WoodOption> cachedWoodOptions;
     private final Map<Item, Integer> pickupCooldowns = new HashMap<>();
+    private final Map<String, Integer> getDebugCooldowns = new HashMap<>();
+    private FuelPlan cachedFuelPlan;
     private String status = "Starting";
     private String focus = "";
+    private int getDebugTick;
 
     public GetProcess(Baritone baritone) {
         super(baritone);
@@ -107,6 +119,7 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
         this.quantity = Math.max(1, quantity);
         this.status = "Starting";
         this.focus = shortName(item);
+        getDebug("target " + shortName(item) + " x" + this.quantity);
     }
 
     @Override
@@ -120,6 +133,7 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
         this.targetIndex = 0;
         if (!this.targets.isEmpty()) {
             activateTarget(this.targets.get(0));
+            getDebug("batch targets " + this.targets.size());
         }
     }
 
@@ -134,6 +148,7 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
             return null;
         }
         tickPickupCooldowns();
+        tickGetDebug();
 
         if (count(target) >= quantity) {
             return finishTarget();
@@ -143,12 +158,21 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
             return commandForStep(ensureDroppedItem(pickupItem, pickupDesired));
         }
 
+        if (subAction == SubAction.RECLAIMING_WORKSTATION) {
+            return commandForStep(ensureReclaimingWorkstation());
+        }
+
         if (craftAction != null) {
             return tickCraftAction(isSafeToCancel);
         }
 
         if (smeltAction != null) {
             return tickSmeltAction(isSafeToCancel);
+        }
+
+        Step gatherStep = ensureNearestGatherNeed();
+        if (gatherStep.type != StepType.READY) {
+            return commandForStep(gatherStep);
         }
 
         Step step = ensureItem(target, quantity, new HashSet<>());
@@ -196,6 +220,7 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
             status = "Planning recipe";
             focus = shortName(item) + " from " + craftingRecipe.getIngredients().stream().filter(ingredient -> !ingredient.isEmpty()).count() + " ingredients";
             Map<Item, Integer> requirements = selectRequirements(craftingRecipe);
+            getDebug("recipe " + shortName(item) + " <- " + summarizeItems(requirements));
             if (requirements.isEmpty()) {
                 visiting.remove(item);
                 return Step.unsupported("recipe has no usable ingredients");
@@ -234,16 +259,22 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
             return Step.pause();
         }
 
+        if (!mineSources(item).isEmpty()) {
+            Step mined = ensureMined(item, desired, visiting);
+            visiting.remove(item);
+            return mined;
+        }
+
         Optional<SmeltingRecipe> smelting = findBestSmeltingRecipe(item, visiting);
         if (smelting.isPresent()) {
+            getDebug("smelt recipe " + shortName(item) + " input " + shortName(firstSmeltInput(smelting.get())));
             Step smelt = planSmelt(item, desired, smelting.get(), visiting);
             visiting.remove(item);
             return smelt;
         }
 
-        Step mined = ensureMined(item, desired, visiting);
         visiting.remove(item);
-        return mined;
+        return Step.unsupported("no crafting recipe, smelting recipe, or mined block source is registered");
     }
 
     private Step ensureDroppedItem(Item item, int desired) {
@@ -287,6 +318,7 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
         pickupTicks = 0;
         pickupDesired = desired;
         baritone.getFollowProcess().pickup(stack -> stack.is(item));
+        getDebug("pickup " + shortName(item) + " total " + desired + " dropped " + matchingDroppedItemCount(item));
         status = "Picking up";
         focus = shortName(item) + " from dropped items";
         return Step.defer();
@@ -307,6 +339,7 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
                 return Step.defer();
             }
             if (workstationPos != null && ctx.world().getBlockState(workstationPos).getBlock() == block) {
+                recordTemporaryWorkstation(block, placeItem, workstationPos);
                 subAction = SubAction.NONE;
                 return openWorkstation(block);
             }
@@ -334,7 +367,7 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
             clearSubAction();
         }
 
-        Optional<BlockPos> nearby = findNearbyWorkstation(block);
+        Optional<BlockPos> nearby = knownTemporaryWorkstation(block).or(() -> findNearbyWorkstation(block));
         if (nearby.isPresent()) {
             status = "Using nearby " + shortName(placeItem);
             focus = formatPos(nearby.get());
@@ -348,13 +381,13 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
             return stationItem;
         }
 
+        if (closeOpenGui("Closing GUI", "Preparing to place " + shortName(placeItem))) {
+            return Step.pause();
+        }
+
         Step hotbar = selectOrMoveToHotbar(placeItem);
         if (hotbar.type != StepType.READY) {
             return hotbar;
-        }
-
-        if (closeOpenGui("Closing GUI", "Preparing to place " + shortName(placeItem))) {
-            return Step.pause();
         }
 
         Optional<BlockPos> placement = findWorkstationPlacement();
@@ -368,6 +401,7 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
         workstationPos = placement.get();
         workstationOpenAttempts = 0;
         subAction = SubAction.BUILDING_WORKSTATION;
+        getDebug("place workstation " + shortName(placeItem) + " at " + formatPos(workstationPos));
         baritone.getBuilderProcess().build(shortName(placeItem), workstationSchematic(block), workstationPos);
         status = "Placing " + shortName(placeItem);
         focus = formatPos(workstationPos);
@@ -421,10 +455,17 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
         return false;
     }
 
+    private AbstractContainerMenu activeMenu() {
+        if (ctx.minecraft() != null && ctx.minecraft().screen instanceof AbstractContainerScreen<?> screen) {
+            return screen.getMenu();
+        }
+        return ctx.player().containerMenu;
+    }
+
     private Step ensureMined(Item item, int desired, Set<Item> visiting) {
         if (subAction == SubAction.MINING && item == miningItem) {
             status = "Mining";
-            focus = shortName(item) + " " + count(item) + "/" + desired;
+            focus = shortName(item) + " " + count(item) + "/" + Math.max(desired, miningDesired);
             if (closeOpenGui("Closing GUI", "Continuing mining")) {
                 return Step.pause();
             }
@@ -453,13 +494,20 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
             return Step.unsupported("no source block can currently be mined for drops");
         }
 
+        Step reclaim = ensureReclaimedBeforeTravel(nearestMineSourceDistanceSq(item));
+        if (reclaim.type != StepType.READY) {
+            return reclaim;
+        }
+
         if (closeOpenGui("Closing GUI", "Preparing to mine " + shortName(item))) {
             return Step.pause();
         }
 
         miningItem = item;
+        miningDesired = batchedMineTarget(item, desired);
         subAction = SubAction.MINING;
-        baritone.getMineProcess().mine(batchedMineTarget(item, desired), sources.toArray(new Block[0]));
+        getDebug("mine " + shortName(item) + " total " + miningDesired + " sources " + summarizeBlocks(sources));
+        baritone.getMineProcess().mine(miningDesired, sources.toArray(new Block[0]));
         status = "Mining";
         focus = shortName(item) + " from " + summarizeBlocks(sources);
         return Step.defer();
@@ -480,6 +528,191 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
         // gatherNeeds() already subtracts current inventory, so target = what we hold + what is still needed.
         int target = Math.max(desired, count(item) + Math.min(extra, 1024));
         return target;
+    }
+
+    private Step ensureNearestGatherNeed() {
+        if (subAction == SubAction.MINING && miningItem != null) {
+            return ensureMined(miningItem, Math.max(miningDesired, count(miningItem)), new HashSet<>());
+        }
+        if (subAction != SubAction.NONE) {
+            return Step.ready();
+        }
+
+        GatherNeed need = nearestGatherNeed(gatherNeeds());
+        if (need == null) {
+            return Step.ready();
+        }
+
+        Step reclaim = ensureReclaimedBeforeTravel(need.distanceSq);
+        if (reclaim.type != StepType.READY) {
+            return reclaim;
+        }
+
+        getDebug("nearest gather " + shortName(need.item) + " total " + need.desiredTotal + " dist " + formatDistanceSq(need.distanceSq));
+        status = "Gathering materials";
+        focus = shortName(need.item) + " " + count(need.item) + "/" + need.desiredTotal;
+        Step dropped = ensureDroppedItem(need.item, need.desiredTotal);
+        if (dropped.type != StepType.READY) {
+            return dropped;
+        }
+
+        if (mineSources(need.item).isEmpty()) {
+            return Step.ready();
+        }
+        return ensureMined(need.item, need.desiredTotal, new HashSet<>());
+    }
+
+    private Step ensureReclaimedBeforeTravel(double distanceSq) {
+        pruneTemporaryWorkstations();
+        if (temporaryWorkstations.isEmpty()) {
+            return Step.ready();
+        }
+        if (distanceSq != UNKNOWN_SOURCE_DISTANCE && distanceSq < WORKSTATION_RECLAIM_DISTANCE * WORKSTATION_RECLAIM_DISTANCE) {
+            return Step.ready();
+        }
+        return startReclaimWorkstation(temporaryWorkstations.get(temporaryWorkstations.size() - 1));
+    }
+
+    private Step startReclaimWorkstation(TemporaryWorkstation workstation) {
+        if (ctx.world().getBlockState(workstation.pos).getBlock() != workstation.block) {
+            temporaryWorkstations.remove(workstation);
+            return Step.ready();
+        }
+
+        Step tool = ensureMiningTool(workstation.item, List.of(workstation.block), new HashSet<>());
+        if (tool.type != StepType.READY) {
+            return tool;
+        }
+
+        if (closeOpenGui("Closing GUI", "Reclaiming " + shortName(workstation.item))) {
+            return Step.pause();
+        }
+
+        reclaimingWorkstation = workstation;
+        reclaimingDesired = count(workstation.item) + 1;
+        subAction = SubAction.RECLAIMING_WORKSTATION;
+        baritone.getMineProcess().mine(reclaimingDesired, workstation.block);
+        status = "Reclaiming";
+        focus = shortName(workstation.item) + " at " + formatPos(workstation.pos);
+        getDebug("reclaim workstation " + shortName(workstation.item) + " at " + formatPos(workstation.pos));
+        return Step.defer();
+    }
+
+    private Step ensureReclaimingWorkstation() {
+        if (reclaimingWorkstation == null) {
+            clearSubAction();
+            return Step.ready();
+        }
+        status = "Reclaiming";
+        focus = shortName(reclaimingWorkstation.item) + " at " + formatPos(reclaimingWorkstation.pos);
+        if (baritone.getMineProcess().isActive()) {
+            return Step.defer();
+        }
+        boolean stillThere = ctx.world().getBlockState(reclaimingWorkstation.pos).getBlock() == reclaimingWorkstation.block;
+        boolean pickedUp = count(reclaimingWorkstation.item) >= reclaimingDesired;
+        if (!stillThere || pickedUp) {
+            temporaryWorkstations.remove(reclaimingWorkstation);
+            getDebug("reclaimed workstation " + shortName(reclaimingWorkstation.item) + " pickedUp=" + pickedUp);
+        } else {
+            getDebug("reclaim stopped before " + shortName(reclaimingWorkstation.item) + " was collected");
+        }
+        clearSubAction();
+        reclaimingWorkstation = null;
+        reclaimingDesired = 0;
+        return Step.pause();
+    }
+
+    private void recordTemporaryWorkstation(Block block, Item item, BlockPos pos) {
+        for (TemporaryWorkstation workstation : temporaryWorkstations) {
+            if (workstation.pos.equals(pos) && workstation.block == block) {
+                return;
+            }
+        }
+        temporaryWorkstations.add(new TemporaryWorkstation(block, item, pos.immutable()));
+        getDebug("remember workstation " + shortName(item) + " at " + formatPos(pos));
+    }
+
+    private void pruneTemporaryWorkstations() {
+        temporaryWorkstations.removeIf(workstation -> ctx.world().getBlockState(workstation.pos).getBlock() != workstation.block);
+    }
+
+    private GatherNeed nearestGatherNeed(Map<Item, Integer> needs) {
+        GatherNeed best = null;
+        for (Map.Entry<Item, Integer> entry : needs.entrySet()) {
+            Item item = entry.getKey();
+            int missing = entry.getValue();
+            if (item == null || missing <= 0) {
+                continue;
+            }
+            boolean canPickup = hasInventorySpaceFor(item) && matchingDroppedItemCount(item) > 0;
+            boolean canMine = !mineSources(item).isEmpty();
+            if (!canPickup && !canMine) {
+                continue;
+            }
+
+            GatherNeed candidate = new GatherNeed(item, count(item) + missing, nearestGatherSourceDistanceSq(item));
+            if (best == null || compareGatherNeed(candidate, best) < 0) {
+                best = candidate;
+            }
+        }
+        return best;
+    }
+
+    private int compareGatherNeed(GatherNeed first, GatherNeed second) {
+        int distance = Double.compare(first.distanceSq, second.distanceSq);
+        if (distance != 0) {
+            return distance;
+        }
+        ResourceLocation firstId = BuiltInRegistries.ITEM.getKey(first.item);
+        ResourceLocation secondId = BuiltInRegistries.ITEM.getKey(second.item);
+        String firstName = firstId == null ? String.valueOf(first.item) : firstId.toString();
+        String secondName = secondId == null ? String.valueOf(second.item) : secondId.toString();
+        return firstName.compareTo(secondName);
+    }
+
+    private double nearestGatherSourceDistanceSq(Item item) {
+        double dropped = nearestDroppedItemDistanceSq(item);
+        double mined = nearestMineSourceDistanceSq(item);
+        return Math.min(dropped, mined);
+    }
+
+    private double nearestDroppedItemDistanceSq(Item item) {
+        if (!hasInventorySpaceFor(item)) {
+            return UNKNOWN_SOURCE_DISTANCE;
+        }
+        int maxDist = Baritone.settings().followTargetMaxDistance.value;
+        return ctx.entitiesStream()
+                .filter(entity -> entity instanceof ItemEntity)
+                .filter(Entity::isAlive)
+                .filter(entity -> maxDist == 0 || entity.distanceToSqr(ctx.player()) <= maxDist * maxDist)
+                .map(entity -> (ItemEntity) entity)
+                .filter(entity -> entity.getItem().is(item))
+                .mapToDouble(entity -> entity.distanceToSqr(ctx.player()))
+                .min()
+                .orElse(UNKNOWN_SOURCE_DISTANCE);
+    }
+
+    private double nearestMineSourceDistanceSq(Item item) {
+        List<Block> sources = mineSources(item);
+        if (sources.isEmpty()) {
+            return UNKNOWN_SOURCE_DISTANCE;
+        }
+        try {
+            List<BlockPos> found = MineProcess.searchWorld(
+                    new CalculationContext(baritone),
+                    new BlockOptionalMetaLookup(sources),
+                    1,
+                    new ArrayList<>(),
+                    new ArrayList<>(),
+                    new ArrayList<>()
+            );
+            if (!found.isEmpty()) {
+                return ctx.playerFeet().distSqr(found.get(0));
+            }
+        } catch (RuntimeException ignored) {
+            // Distance is only a scheduling hint. Mining itself will still do the authoritative search.
+        }
+        return UNKNOWN_SOURCE_DISTANCE;
     }
 
     /**
@@ -541,6 +774,11 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
                 available.merge(item, crafts * yield - remaining, Integer::sum);
                 return;
             }
+            if (!mineSources(item).isEmpty()) {
+                planMiningTool(item, gather, available, visiting);
+                gather.merge(item, remaining, Integer::sum);
+                return;
+            }
             Optional<SmeltingRecipe> smelting = findBestSmeltingRecipe(item, visiting);
             if (smelting.isPresent()) {
                 planWorkstation(Blocks.FURNACE, Items.FURNACE, gather, available, visiting);
@@ -548,10 +786,9 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
                 if (input != null) {
                     expand(input, remaining, gather, available, visiting);
                 }
-                Item fuel = chooseFuel(visiting);
+                Item fuel = chooseFuel(visiting, remaining);
                 if (fuel != null) {
-                    int perFuel = Math.max(1, AbstractFurnaceBlockEntity.getFuel().getOrDefault(fuel, 0) / 200);
-                    expand(fuel, (remaining + perFuel - 1) / perFuel, gather, available, visiting);
+                    expand(fuel, fuelItemsNeeded(fuel, remaining), gather, available, visiting);
                 }
                 return;
             }
@@ -566,7 +803,7 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
         if (available.getOrDefault(blockItem, 0) > 0) {
             return;
         }
-        if (isWorkstationOpen(block) || findNearbyWorkstation(block).isPresent()) {
+        if (isWorkstationOpen(block) || knownTemporaryWorkstation(block).isPresent() || findNearbyWorkstation(block).isPresent()) {
             available.merge(blockItem, 1, Integer::sum);
             return;
         }
@@ -609,7 +846,7 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
             return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
         }
 
-        AbstractContainerMenu menu = ctx.player().containerMenu;
+        AbstractContainerMenu menu = activeMenu();
         if (!canCraftInMenu(craftAction.recipe, menu)) {
             status = "Waiting for crafting grid";
             focus = craftAction.recipe.canCraftInDimensions(2, 2) ? "Need inventory grid" : "Need crafting table";
@@ -681,9 +918,18 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
             return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
         }
 
-        AbstractContainerMenu menu = ctx.player().containerMenu;
-        if (!(menu instanceof FurnaceMenu)) {
-            // The furnace GUI closed unexpectedly; let planning reopen it.
+        AbstractContainerMenu menu = activeMenu();
+        if (!(menu instanceof FurnaceMenu furnaceMenu)) {
+            if (smeltAction.loaded) {
+                if (smeltAction.waitTicks-- > 0) {
+                    status = "Smelting";
+                    focus = shortName(smeltAction.item) + " cooking";
+                    return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
+                }
+                Step furnace = ensureWorkstation(Blocks.FURNACE, Items.FURNACE, new HashSet<>());
+                return commandForStep(furnace);
+            }
+            // The furnace GUI closed unexpectedly before anything was loaded; let planning restart the smelt.
             smeltAction = null;
             return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
         }
@@ -708,15 +954,24 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
         }
 
         boolean loaded = false;
-        if (!menu.getSlot(1).hasItem() && count(smeltAction.fuel) > 0 && moveToFurnace(menu, smeltAction.fuel)) {
+        if (!menu.getSlot(1).hasItem() && count(smeltAction.fuel) > 0 && moveToFurnaceSlot(menu, smeltAction.fuel, 1)) {
+            getDebug("furnace fuel slot <- " + shortName(smeltAction.fuel));
             loaded = true;
         }
-        if (!menu.getSlot(0).hasItem() && count(smeltAction.input) > 0 && moveToFurnace(menu, smeltAction.input)) {
+        if (!menu.getSlot(0).hasItem() && count(smeltAction.input) > 0 && moveToFurnaceSlot(menu, smeltAction.input, 0)) {
+            getDebug("furnace input slot <- " + shortName(smeltAction.input));
             loaded = true;
         }
         if (loaded) {
             smeltAction.cooldown = 2;
             smeltAction.attempts = 0;
+            return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
+        }
+
+        if (menu.getSlot(0).hasItem() && isFurnaceCooking(furnaceMenu)) {
+            smeltAction.loaded = true;
+            smeltAction.waitTicks = Math.max(SMELT_REOPEN_BUFFER_TICKS, smeltAction.remainingSmelts() * 200 + SMELT_REOPEN_BUFFER_TICKS);
+            closeOpenGui("Smelting", shortName(smeltAction.item) + " cooking");
             return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
         }
 
@@ -744,11 +999,25 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
         return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
     }
 
-    private boolean moveToFurnace(AbstractContainerMenu menu, Item item) {
+    private boolean isFurnaceCooking(FurnaceMenu menu) {
+        return menu.isLit() || menu.getSlot(1).hasItem();
+    }
+
+    private boolean moveToFurnaceSlot(AbstractContainerMenu menu, Item item, int targetSlot) {
+        ItemStack moving = new ItemStack(item);
+        if (!menu.getCarried().isEmpty() || menu.getSlot(targetSlot).hasItem() || !menu.getSlot(targetSlot).mayPlace(moving)) {
+            getDebug("furnace slot " + targetSlot + " rejected " + shortName(item));
+            return false;
+        }
+
         // Furnace slots 0 (input), 1 (fuel) and 2 (result) precede the player inventory slots.
         for (int i = 3; i < menu.slots.size(); i++) {
             if (menu.getSlot(i).getItem().is(item)) {
-                ctx.playerController().windowClick(menu.containerId, i, 0, ClickType.QUICK_MOVE, ctx.player());
+                ctx.playerController().windowClick(menu.containerId, i, 0, ClickType.PICKUP, ctx.player());
+                ctx.playerController().windowClick(menu.containerId, targetSlot, 0, ClickType.PICKUP, ctx.player());
+                if (!menu.getCarried().isEmpty()) {
+                    ctx.playerController().windowClick(menu.containerId, i, 0, ClickType.PICKUP, ctx.player());
+                }
                 return true;
             }
         }
@@ -959,12 +1228,12 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
             return inputStep;
         }
 
-        Item fuel = chooseFuel(visiting);
+        Item fuel = chooseFuel(visiting, needed);
         if (fuel == null) {
             return Step.unsupported("no usable fuel is available for smelting");
         }
-        int perFuel = Math.max(1, AbstractFurnaceBlockEntity.getFuel().getOrDefault(fuel, 0) / 200);
-        int fuelNeeded = Math.max(1, (needed + perFuel - 1) / perFuel);
+        int fuelNeeded = fuelItemsNeeded(fuel, needed);
+        getDebug("smelt plan " + shortName(item) + " need " + needed + " input " + shortName(input) + " fuel " + shortName(fuel) + " x" + fuelNeeded);
         Step fuelStep = ensureItem(fuel, fuelNeeded, visiting);
         if (fuelStep.type != StepType.READY) {
             return fuelStep;
@@ -975,37 +1244,176 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
             return furnace;
         }
 
-        smeltAction = new SmeltAction(item, input, fuel, desired);
+        smeltAction = new SmeltAction(item, input, fuel, desired, count(item));
         status = "Smelting queued";
         focus = shortName(item) + " from " + shortName(input);
         return Step.pause();
     }
 
-    private Item chooseFuel(Set<Item> visiting) {
+    private Item chooseFuel(Set<Item> visiting, int smeltsNeeded) {
+        int inventoryHash = inventoryFuelHash();
+        BlockPos origin = ctx.playerFeet();
+        if (cachedFuelPlan != null && cachedFuelPlan.matches(smeltsNeeded, inventoryHash, origin)) {
+            return cachedFuelPlan.item;
+        }
+
         Map<Item, Integer> fuels = AbstractFurnaceBlockEntity.getFuel();
-        if (count(Items.COAL) > 0) {
-            return Items.COAL;
+        List<FuelCandidate> candidates = new ArrayList<>();
+        Set<Item> checked = new HashSet<>();
+
+        if (fuels.containsKey(Items.COAL) && checked.add(Items.COAL)) {
+            addCoalFuelCandidate(candidates, Items.COAL, smeltsNeeded, visiting);
         }
-        if (count(Items.CHARCOAL) > 0) {
-            return Items.CHARCOAL;
+        if ((count(Items.CHARCOAL) > 0 || matchingDroppedItemCount(Items.CHARCOAL) > 0) && fuels.containsKey(Items.CHARCOAL) && checked.add(Items.CHARCOAL)) {
+            addHeldFuelCandidate(candidates, Items.CHARCOAL, smeltsNeeded, visiting, 0);
         }
-        for (Item fuel : fuels.keySet()) {
-            if (isReasonableFuel(fuel) && count(fuel) > 0) {
-                return fuel;
+
+        for (WoodOption option : woodOptions()) {
+            if (fuels.containsKey(option.planks) && checked.add(option.planks)) {
+                addPlankFuelCandidate(candidates, option.planks, smeltsNeeded, visiting);
             }
         }
-        if (fuels.containsKey(Items.COAL) && canObtain(Items.COAL, visiting)) {
-            return Items.COAL;
-        }
-        if (fuels.containsKey(Items.CHARCOAL) && canObtain(Items.CHARCOAL, visiting)) {
-            return Items.CHARCOAL;
-        }
-        for (Item fuel : fuels.keySet()) {
-            if (isReasonableFuel(fuel) && canObtain(fuel, visiting)) {
-                return fuel;
+
+        if (candidates.isEmpty()) {
+            for (Item fuel : fuels.keySet()) {
+                if (isReasonableFuel(fuel) && checked.add(fuel)) {
+                    addHeldFuelCandidate(candidates, fuel, smeltsNeeded, visiting, 8);
+                }
             }
         }
-        return null;
+
+        Optional<FuelCandidate> best = candidates.stream()
+                .min(Comparator.comparingDouble(FuelCandidate::score).thenComparing(candidate -> name(candidate.item)));
+        getDebug("fuel candidates " + summarizeFuelCandidates(candidates) + " -> " + best.map(candidate -> shortName(candidate.item)).orElse("none"));
+        Item item = best.map(candidate -> candidate.item).orElse(null);
+        cachedFuelPlan = new FuelPlan(item, smeltsNeeded, inventoryHash, origin);
+        return item;
+    }
+
+    private int inventoryFuelHash() {
+        int hash = 1;
+        for (ItemStack stack : ctx.player().getInventory().items) {
+            if (!stack.isEmpty()) {
+                hash = 31 * hash + BuiltInRegistries.ITEM.getId(stack.getItem());
+                hash = 31 * hash + stack.getCount();
+            }
+        }
+        for (ItemStack stack : ctx.player().getInventory().offhand) {
+            if (!stack.isEmpty()) {
+                hash = 31 * hash + BuiltInRegistries.ITEM.getId(stack.getItem());
+                hash = 31 * hash + stack.getCount();
+            }
+        }
+        return hash;
+    }
+
+    private void addCoalFuelCandidate(List<FuelCandidate> candidates, Item fuel, int smeltsNeeded, Set<Item> visiting) {
+        int held = count(fuel);
+        double distance = nearestGatherSourceDistanceSq(fuel);
+        if (held <= 0 && matchingDroppedItemCount(fuel) <= 0 && distance == UNKNOWN_SOURCE_DISTANCE) {
+            return;
+        }
+        addFuelCandidate(candidates, fuel, smeltsNeeded, visiting, held, distance, held > 0 ? 0 : 3, true);
+    }
+
+    private void addHeldFuelCandidate(List<FuelCandidate> candidates, Item fuel, int smeltsNeeded, Set<Item> visiting, int priority) {
+        addFuelCandidate(candidates, fuel, smeltsNeeded, visiting, count(fuel), nearestFuelSourceDistanceSq(fuel), priority, false);
+    }
+
+    private void addPlankFuelCandidate(List<FuelCandidate> candidates, Item planks, int smeltsNeeded, Set<Item> visiting) {
+        int needed = fuelItemsNeeded(planks, smeltsNeeded);
+        int heldPlanks = count(planks);
+        int heldCraftablePlanks = heldPlanks + craftablePlanksFromHeldLogs(planks);
+        int priority = heldPlanks >= needed ? 1 : heldCraftablePlanks >= needed ? 2 : 4;
+        double distance = heldCraftablePlanks >= needed ? 0 : nearestPlankFuelSourceDistanceSq(planks);
+        addFuelCandidate(candidates, planks, smeltsNeeded, visiting, heldCraftablePlanks, distance, priority, true);
+    }
+
+    private void addFuelCandidate(List<FuelCandidate> candidates, Item fuel, int smeltsNeeded, Set<Item> visiting, int effectiveHeld, double distanceSq, int priority, boolean allowObtain) {
+        int needed = fuelItemsNeeded(fuel, smeltsNeeded);
+        if (needed <= 0) {
+            return;
+        }
+        if (effectiveHeld <= 0
+                && matchingDroppedItemCount(fuel) <= 0
+                && distanceSq == UNKNOWN_SOURCE_DISTANCE
+                && (!allowObtain || !canObtainFuel(fuel, visiting))) {
+            return;
+        }
+        candidates.add(new FuelCandidate(fuel, needed, effectiveHeld, distanceSq, priority));
+    }
+
+    private boolean canObtainFuel(Item fuel, Set<Item> visiting) {
+        // Don't plan to make charcoal as fuel; using the wood directly as fuel is simpler and faster.
+        return fuel != Items.CHARCOAL && canObtain(fuel, visiting);
+    }
+
+    private int fuelItemsNeeded(Item fuel, int smeltsNeeded) {
+        int burnTicks = fuelBurnTicks(fuel);
+        if (burnTicks <= 0) {
+            return 0;
+        }
+        return Math.max(1, (smeltsNeeded * 200 + burnTicks - 1) / burnTicks);
+    }
+
+    private int fuelBurnTicks(Item fuel) {
+        return AbstractFurnaceBlockEntity.getFuel().getOrDefault(fuel, 0);
+    }
+
+    private double nearestFuelSourceDistanceSq(Item fuel) {
+        double ownItem = nearestGatherSourceDistanceSq(fuel);
+        double wood = nearestWoodFuelDistanceSq(fuel);
+        return Math.min(ownItem, wood);
+    }
+
+    private int craftablePlanksFromHeldLogs(Item planks) {
+        int total = 0;
+        for (WoodOption option : woodOptions()) {
+            if (option.planks == planks) {
+                total += count(option.logItem) * 4;
+            }
+        }
+        return total;
+    }
+
+    private double nearestPlankFuelSourceDistanceSq(Item planks) {
+        double best = nearestGatherSourceDistanceSq(planks);
+        for (WoodOption option : woodOptions()) {
+            if (option.planks == planks) {
+                best = Math.min(best, nearestBlockDistanceSq(option.logBlock, 24, 12));
+            }
+        }
+        return best;
+    }
+
+    private double nearestWoodFuelDistanceSq(Item fuel) {
+        double best = UNKNOWN_SOURCE_DISTANCE;
+        for (WoodOption option : woodOptions()) {
+            if (option.logItem != fuel && option.planks != fuel) {
+                continue;
+            }
+            double distance = nearestBlockDistanceSq(option.logBlock, 24, 12);
+            if (distance < best) {
+                best = distance;
+            }
+        }
+        return best;
+    }
+
+    private double nearestBlockDistanceSq(Block block, int horizontalRange, int verticalRange) {
+        BlockPos feet = ctx.playerFeet();
+        double best = UNKNOWN_SOURCE_DISTANCE;
+        for (int dx = -horizontalRange; dx <= horizontalRange; dx++) {
+            for (int dy = -verticalRange; dy <= verticalRange; dy++) {
+                for (int dz = -horizontalRange; dz <= horizontalRange; dz++) {
+                    BlockPos pos = feet.offset(dx, dy, dz);
+                    if (ctx.world().getBlockState(pos).getBlock() == block) {
+                        best = Math.min(best, feet.distSqr(pos));
+                    }
+                }
+            }
+        }
+        return best;
     }
 
     private boolean isReasonableFuel(Item fuel) {
@@ -1209,28 +1617,32 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
     }
 
     private List<Block> findMineSources(Item item) {
-        ItemStack target = new ItemStack(item);
         List<Block> result = new ArrayList<>();
         if (item == Items.COBBLESTONE) {
             result.add(Blocks.STONE);
         }
         Block direct = Block.byItem(item);
-        if (direct != Blocks.AIR && !skipMineSource(item, direct)) {
+        if (direct != Blocks.AIR && !skipMineSource(item, direct) && blockDropsItem(direct, item)) {
             result.add(direct);
         }
         BuiltInRegistries.BLOCK.forEach(block -> {
             if (block == Blocks.AIR || result.contains(block) || skipMineSource(item, block)) {
                 return;
             }
-            try {
-                if (new BlockOptionalMeta(block).matches(target)) {
-                    result.add(block);
-                }
-            } catch (RuntimeException ignored) {
-                // Some modded loot tables can be unavailable client-side; skip them instead of failing #get.
+            if (blockDropsItem(block, item)) {
+                result.add(block);
             }
         });
         return result;
+    }
+
+    private boolean blockDropsItem(Block block, Item item) {
+        try {
+            return new BlockOptionalMeta(block).matches(new ItemStack(item));
+        } catch (RuntimeException ignored) {
+            // Some modded loot tables can be unavailable client-side; skip them instead of failing #get.
+            return false;
+        }
     }
 
     private boolean skipMineSource(Item item, Block block) {
@@ -1356,6 +1768,9 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
     }
 
     private Step selectOrMoveCorrectToolToHotbar(BlockState state, Item item) {
+        if (closeOpenGui("Closing GUI", "Preparing " + shortName(item))) {
+            return Step.pause();
+        }
         int hotbarSlot = findCorrectToolSlot(state, 0, 9);
         if (hotbarSlot != -1) {
             status = "Selecting";
@@ -1381,6 +1796,9 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
     }
 
     private Step selectOrMoveToHotbar(Item item) {
+        if (closeOpenGui("Closing GUI", "Preparing " + shortName(item))) {
+            return Step.pause();
+        }
         for (int i = 0; i < 9; i++) {
             if (ctx.player().getInventory().items.get(i).is(item)) {
                 status = "Selecting";
@@ -1423,6 +1841,10 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
     }
 
     private Optional<BlockPos> findNearbyWorkstation(Block block) {
+        Optional<BlockPos> known = knownTemporaryWorkstation(block);
+        if (known.isPresent()) {
+            return known;
+        }
         BlockPos feet = ctx.playerFeet();
         List<BlockPos> found = new ArrayList<>();
         for (int dx = -CRAFTING_TABLE_SCAN_HORIZONTAL; dx <= CRAFTING_TABLE_SCAN_HORIZONTAL; dx++) {
@@ -1436,6 +1858,20 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
             }
         }
         return found.stream().min(Comparator.comparingDouble(feet::distSqr));
+    }
+
+    private Optional<BlockPos> knownTemporaryWorkstation(Block block) {
+        pruneTemporaryWorkstations();
+        BlockPos feet = ctx.playerFeet();
+        Optional<BlockPos> active = Optional.empty();
+        if (workstationBlock == block && workstationPos != null && ctx.world().getBlockState(workstationPos).getBlock() == block) {
+            active = Optional.of(workstationPos);
+        }
+        Optional<BlockPos> remembered = temporaryWorkstations.stream()
+                .filter(workstation -> workstation.block == block)
+                .map(workstation -> workstation.pos)
+                .min(Comparator.comparingDouble(feet::distSqr));
+        return active.isPresent() && (remembered.isEmpty() || feet.distSqr(active.get()) <= feet.distSqr(remembered.get())) ? active : remembered;
     }
 
     private boolean hasNearbyBlock(Block block, int horizontalRange, int verticalRange) {
@@ -1526,15 +1962,26 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
         pickupCooldowns.entrySet().removeIf(entry -> entry.setValue(entry.getValue() - 1) <= 0);
     }
 
+    private void tickGetDebug() {
+        getDebugTick++;
+        getDebugCooldowns.entrySet().removeIf(entry -> getDebugTick - entry.getValue() > 200);
+    }
+
     private void clearSubAction() {
         if (subAction == SubAction.PICKING_UP) {
             baritone.getFollowProcess().cancel();
         }
+        if (subAction == SubAction.RECLAIMING_WORKSTATION) {
+            baritone.getMineProcess().cancel();
+        }
         subAction = SubAction.NONE;
         miningItem = null;
+        miningDesired = 0;
         pickupItem = null;
         pickupDesired = 0;
         pickupTicks = 0;
+        reclaimingWorkstation = null;
+        reclaimingDesired = 0;
     }
 
     private void activateTarget(GetTarget next) {
@@ -1544,12 +1991,18 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
         this.smeltAction = null;
         this.subAction = SubAction.NONE;
         this.miningItem = null;
+        this.miningDesired = 0;
         this.pickupItem = null;
         this.pickupDesired = 0;
         this.pickupTicks = 0;
         this.workstationBlock = null;
         this.workstationPos = null;
         this.workstationOpenAttempts = 0;
+        this.reclaimingWorkstation = null;
+        this.reclaimingDesired = 0;
+        this.temporaryWorkstations.clear();
+        this.cachedFuelPlan = null;
+        this.getDebugCooldowns.clear();
         this.status = "Starting";
         this.focus = shortName(next.item);
     }
@@ -1561,12 +2014,16 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
         smeltAction = null;
         subAction = SubAction.NONE;
         miningItem = null;
+        miningDesired = 0;
         pickupItem = null;
         pickupDesired = 0;
         pickupTicks = 0;
         workstationBlock = null;
         workstationPos = null;
         workstationOpenAttempts = 0;
+        reclaimingWorkstation = null;
+        reclaimingDesired = 0;
+        temporaryWorkstations.clear();
         int nextIndex = nextUnsatisfiedTargetIndex(targetIndex + 1);
         if (nextIndex == -1) {
             status = "Finished";
@@ -1638,12 +2095,18 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
         smeltAction = null;
         subAction = SubAction.NONE;
         miningItem = null;
+        miningDesired = 0;
         pickupItem = null;
         pickupDesired = 0;
         pickupTicks = 0;
         workstationBlock = null;
         workstationPos = null;
         workstationOpenAttempts = 0;
+        reclaimingWorkstation = null;
+        reclaimingDesired = 0;
+        temporaryWorkstations.clear();
+        cachedFuelPlan = null;
+        getDebugCooldowns.clear();
         status = "Idle";
         focus = "";
         cancelDelegatedProcesses();
@@ -1689,9 +2152,46 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
         baritone.getPathingControlManager()
                 .mostRecentInControl()
                 .filter(process -> process != this)
-                .map(process -> "Active: " + process.displayName())
+                .map(process -> "Active: " + compactActiveProcessName(process.displayName()))
                 .ifPresent(lines::add);
         return lines;
+    }
+
+    private static String compactActiveProcessName(String displayName) {
+        if (!displayName.startsWith("Mine BlockOptionalMetaLookup{")) {
+            return displayName;
+        }
+        List<String> blocks = new ArrayList<>();
+        int index = 0;
+        while ((index = displayName.indexOf("block=Block{minecraft:", index)) != -1) {
+            index += "block=Block{minecraft:".length();
+            int end = displayName.indexOf('}', index);
+            if (end == -1) {
+                break;
+            }
+            blocks.add(displayName.substring(index, end));
+            index = end + 1;
+        }
+        if (blocks.isEmpty()) {
+            return "Mine";
+        }
+        if (blocks.size() == 1) {
+            return "Mine " + blocks.get(0);
+        }
+        return "Mine " + blocks.get(0) + " +" + (blocks.size() - 1);
+    }
+
+    private void getDebug(String message) {
+        if (!Baritone.settings().getDebug.value) {
+            return;
+        }
+        String line = "[GetDebug] " + message;
+        Integer lastTick = getDebugCooldowns.get(line);
+        if (lastTick != null && getDebugTick - lastTick < 40) {
+            return;
+        }
+        getDebugCooldowns.put(line, getDebugTick);
+        logDirect(line);
     }
 
     private static String name(Item item) {
@@ -1702,6 +2202,37 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
     private static String shortName(Item item) {
         ResourceLocation id = BuiltInRegistries.ITEM.getKey(item);
         return id == null ? String.valueOf(item) : id.getPath();
+    }
+
+    private static String summarizeItems(Map<Item, Integer> items) {
+        if (items.isEmpty()) {
+            return "nothing";
+        }
+        List<String> parts = new ArrayList<>();
+        items.forEach((item, count) -> parts.add(count + "x " + shortName(item)));
+        return String.join(", ", parts);
+    }
+
+    private static String summarizeFuelCandidates(List<FuelCandidate> candidates) {
+        if (candidates.isEmpty()) {
+            return "none";
+        }
+        List<String> parts = new ArrayList<>();
+        candidates.stream()
+                .sorted(Comparator.comparingDouble(FuelCandidate::score).thenComparing(candidate -> name(candidate.item)))
+                .limit(8)
+                .forEach(candidate -> parts.add(shortName(candidate.item) + " tier " + candidate.priority + " need " + candidate.needed + " held " + candidate.held + " dist " + formatDistanceSq(candidate.distanceSq)));
+        if (candidates.size() > 8) {
+            parts.add("+" + (candidates.size() - 8) + " more");
+        }
+        return String.join("; ", parts);
+    }
+
+    private static String formatDistanceSq(double distanceSq) {
+        if (distanceSq == UNKNOWN_SOURCE_DISTANCE) {
+            return "unknown";
+        }
+        return String.format("%.1f", Math.sqrt(distanceSq));
     }
 
     private static String summarizeBlocks(List<Block> blocks) {
@@ -1736,6 +2267,7 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
         NONE,
         PICKING_UP,
         MINING,
+        RECLAIMING_WORKSTATION,
         BUILDING_WORKSTATION,
         OPENING_WORKSTATION
     }
@@ -1766,14 +2298,94 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
         private final Item input;
         private final Item fuel;
         private final int desired;
+        private final int plannedStartCount;
         private int cooldown;
         private int attempts;
+        private boolean loaded;
+        private int waitTicks;
 
-        private SmeltAction(Item item, Item input, Item fuel, int desired) {
+        private SmeltAction(Item item, Item input, Item fuel, int desired, int plannedStartCount) {
             this.item = item;
             this.input = input;
             this.fuel = fuel;
             this.desired = desired;
+            this.plannedStartCount = plannedStartCount;
+        }
+
+        private int remainingSmelts() {
+            return Math.max(1, desired - plannedStartCount);
+        }
+    }
+
+    private static final class FuelCandidate {
+        private final Item item;
+        private final int needed;
+        private final int held;
+        private final double distanceSq;
+        private final int priority;
+
+        private FuelCandidate(Item item, int needed, int held, double distanceSq, int priority) {
+            this.item = item;
+            this.needed = needed;
+            this.held = held;
+            this.distanceSq = distanceSq;
+            this.priority = priority;
+        }
+
+        private double score() {
+            double source = distanceSq == UNKNOWN_SOURCE_DISTANCE ? 1_000_000 : distanceSq;
+            int shortage = Math.max(0, needed - held);
+            return priority * 1_000_000D + source + shortage * 64D + needed * 8D - Math.min(held, needed) * 8D + preferredFuelBonus();
+        }
+
+        private int preferredFuelBonus() {
+            return item == Items.COAL || item == Items.CHARCOAL ? -64 : 0;
+        }
+    }
+
+    private static final class FuelPlan {
+        private static final int MAX_REUSE_DISTANCE_SQ = 16 * 16;
+
+        private final Item item;
+        private final int smeltsNeeded;
+        private final int inventoryHash;
+        private final BlockPos origin;
+
+        private FuelPlan(Item item, int smeltsNeeded, int inventoryHash, BlockPos origin) {
+            this.item = item;
+            this.smeltsNeeded = smeltsNeeded;
+            this.inventoryHash = inventoryHash;
+            this.origin = origin;
+        }
+
+        private boolean matches(int smeltsNeeded, int inventoryHash, BlockPos current) {
+            return this.smeltsNeeded == smeltsNeeded
+                    && this.inventoryHash == inventoryHash
+                    && this.origin.distSqr(current) <= MAX_REUSE_DISTANCE_SQ;
+        }
+    }
+
+    private static final class TemporaryWorkstation {
+        private final Block block;
+        private final Item item;
+        private final BlockPos pos;
+
+        private TemporaryWorkstation(Block block, Item item, BlockPos pos) {
+            this.block = block;
+            this.item = item;
+            this.pos = pos;
+        }
+    }
+
+    private static final class GatherNeed {
+        private final Item item;
+        private final int desiredTotal;
+        private final double distanceSq;
+
+        private GatherNeed(Item item, int desiredTotal, double distanceSq) {
+            this.item = item;
+            this.desiredTotal = desiredTotal;
+            this.distanceSq = distanceSq;
         }
     }
 
