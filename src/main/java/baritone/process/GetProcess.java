@@ -30,9 +30,11 @@ import net.minecraft.core.NonNullList;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.tags.BlockTags;
+import net.minecraft.tags.ItemTags;
 import net.minecraft.world.inventory.AbstractContainerMenu;
 import net.minecraft.world.inventory.ClickType;
 import net.minecraft.world.inventory.CraftingMenu;
+import net.minecraft.world.inventory.FurnaceMenu;
 import net.minecraft.world.inventory.InventoryMenu;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.item.ItemEntity;
@@ -43,14 +45,15 @@ import net.minecraft.world.item.TieredItem;
 import net.minecraft.world.item.crafting.CraftingRecipe;
 import net.minecraft.world.item.crafting.Ingredient;
 import net.minecraft.world.item.crafting.RecipeType;
+import net.minecraft.world.item.crafting.SmeltingRecipe;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.entity.AbstractFurnaceBlockEntity;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.AABB;
 
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -67,17 +70,7 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
     private static final int PICKUP_RETRY_COOLDOWN_TICKS = 200;
     private static final int CRAFTING_TABLE_SCAN_HORIZONTAL = 32;
     private static final int CRAFTING_TABLE_SCAN_VERTICAL = 8;
-
-    private static final List<WoodOption> WOOD_OPTIONS = Arrays.asList(
-            new WoodOption(Items.OAK_PLANKS, Items.OAK_LOG, Blocks.OAK_LOG),
-            new WoodOption(Items.SPRUCE_PLANKS, Items.SPRUCE_LOG, Blocks.SPRUCE_LOG),
-            new WoodOption(Items.BIRCH_PLANKS, Items.BIRCH_LOG, Blocks.BIRCH_LOG),
-            new WoodOption(Items.JUNGLE_PLANKS, Items.JUNGLE_LOG, Blocks.JUNGLE_LOG),
-            new WoodOption(Items.ACACIA_PLANKS, Items.ACACIA_LOG, Blocks.ACACIA_LOG),
-            new WoodOption(Items.DARK_OAK_PLANKS, Items.DARK_OAK_LOG, Blocks.DARK_OAK_LOG),
-            new WoodOption(Items.MANGROVE_PLANKS, Items.MANGROVE_LOG, Blocks.MANGROVE_LOG),
-            new WoodOption(Items.CHERRY_PLANKS, Items.CHERRY_LOG, Blocks.CHERRY_LOG)
-    );
+    private static final int WORKSTATION_OPEN_MAX_ATTEMPTS = 3;
 
     private final List<GetTarget> targets = new ArrayList<>();
     private int targetIndex;
@@ -85,13 +78,18 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
     private int quantity;
 
     private CraftAction craftAction;
+    private SmeltAction smeltAction;
     private SubAction subAction = SubAction.NONE;
     private Item miningItem;
     private Item pickupItem;
     private int pickupDesired;
     private int pickupTicks;
-    private BlockPos craftingTablePos;
+    private Block workstationBlock;
+    private BlockPos workstationPos;
+    private int workstationOpenAttempts;
     private final Map<Item, List<Block>> mineSourceCache = new HashMap<>();
+    private final Map<Item, Boolean> mineDropSourceCache = new HashMap<>();
+    private List<WoodOption> cachedWoodOptions;
     private final Map<Item, Integer> pickupCooldowns = new HashMap<>();
     private String status = "Starting";
     private String focus = "";
@@ -149,6 +147,10 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
             return tickCraftAction(isSafeToCancel);
         }
 
+        if (smeltAction != null) {
+            return tickSmeltAction(isSafeToCancel);
+        }
+
         Step step = ensureItem(target, quantity, new HashSet<>());
         return commandForStep(step);
     }
@@ -188,7 +190,7 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
             return droppedItem;
         }
 
-        Optional<CraftingRecipe> recipe = findBestRecipe(item);
+        Optional<CraftingRecipe> recipe = findBestRecipe(item, visiting);
         if (recipe.isPresent()) {
             CraftingRecipe craftingRecipe = recipe.get();
             status = "Planning recipe";
@@ -218,7 +220,7 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
             }
 
             if (!craftingRecipe.canCraftInDimensions(2, 2)) {
-                Step table = ensureCraftingTable(visiting);
+                Step table = ensureWorkstation(Blocks.CRAFTING_TABLE, Items.CRAFTING_TABLE, visiting);
                 if (table.type != StepType.READY) {
                     visiting.remove(item);
                     return table;
@@ -230,6 +232,13 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
             focus = shortName(item);
             visiting.remove(item);
             return Step.pause();
+        }
+
+        Optional<SmeltingRecipe> smelting = findBestSmeltingRecipe(item, visiting);
+        if (smelting.isPresent()) {
+            Step smelt = planSmelt(item, desired, smelting.get(), visiting);
+            visiting.remove(item);
+            return smelt;
         }
 
         Step mined = ensureMined(item, desired, visiting);
@@ -283,92 +292,133 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
         return Step.defer();
     }
 
-    private Step ensureCraftingTable(Set<Item> visiting) {
-        status = "Preparing crafting table";
-        focus = "Need 3x3 crafting grid";
-        if (ctx.player().containerMenu instanceof CraftingMenu) {
+    private Step ensureWorkstation(Block block, Item placeItem, Set<Item> visiting) {
+        status = "Preparing " + shortName(placeItem);
+        focus = block == Blocks.CRAFTING_TABLE ? "Need 3x3 crafting grid" : "Need " + shortName(placeItem);
+        if (isWorkstationOpen(block)) {
             clearSubAction();
             return Step.ready();
         }
 
-        if (subAction == SubAction.BUILDING_CRAFTING_TABLE) {
-            status = "Placing crafting table";
-            focus = craftingTablePos == null ? "Waiting for placement" : formatPos(craftingTablePos);
+        if (subAction == SubAction.BUILDING_WORKSTATION && workstationBlock == block) {
+            status = "Placing " + shortName(placeItem);
+            focus = workstationPos == null ? "Waiting for placement" : formatPos(workstationPos);
             if (baritone.getBuilderProcess().isActive()) {
                 return Step.defer();
             }
-            if (craftingTablePos != null && ctx.world().getBlockState(craftingTablePos).getBlock() == Blocks.CRAFTING_TABLE) {
+            if (workstationPos != null && ctx.world().getBlockState(workstationPos).getBlock() == block) {
                 subAction = SubAction.NONE;
-                return openCraftingTable();
+                return openWorkstation(block);
             }
             clearSubAction();
-            return Step.unsupported("failed to place a crafting table");
+            return Step.unsupported("failed to place a " + shortName(placeItem));
         }
 
-        if (subAction == SubAction.OPENING_CRAFTING_TABLE) {
-            status = "Opening crafting table";
-            focus = craftingTablePos == null ? "Finding table" : formatPos(craftingTablePos);
-            if (ctx.player().containerMenu instanceof CraftingMenu) {
+        if (subAction == SubAction.OPENING_WORKSTATION && workstationBlock == block) {
+            status = "Opening " + shortName(placeItem);
+            focus = workstationPos == null ? "Finding " + shortName(placeItem) : formatPos(workstationPos);
+            if (isWorkstationOpen(block)) {
+                workstationOpenAttempts = 0;
                 clearSubAction();
                 return Step.ready();
             }
             if (baritone.getGetToBlockProcess().isActive()) {
                 return Step.defer();
             }
+            if (workstationOpenAttempts >= WORKSTATION_OPEN_MAX_ATTEMPTS) {
+                String name = shortName(placeItem);
+                workstationOpenAttempts = 0;
+                clearSubAction();
+                return Step.unsupported("failed to open " + name + " after " + WORKSTATION_OPEN_MAX_ATTEMPTS + " attempts (menu did not open)");
+            }
             clearSubAction();
         }
 
-        Optional<BlockPos> nearby = findNearbyCraftingTable();
+        Optional<BlockPos> nearby = findNearbyWorkstation(block);
         if (nearby.isPresent()) {
-            status = "Using nearby crafting table";
+            status = "Using nearby " + shortName(placeItem);
             focus = formatPos(nearby.get());
-            craftingTablePos = nearby.get();
-            return openCraftingTable();
+            workstationBlock = block;
+            workstationPos = nearby.get();
+            return openWorkstation(block);
         }
 
-        Step tableItem = ensureItem(Items.CRAFTING_TABLE, 1, visiting);
-        if (tableItem.type != StepType.READY) {
-            return tableItem;
+        Step stationItem = ensureItem(placeItem, 1, visiting);
+        if (stationItem.type != StepType.READY) {
+            return stationItem;
         }
 
-        Step hotbar = selectOrMoveToHotbar(Items.CRAFTING_TABLE);
+        Step hotbar = selectOrMoveToHotbar(placeItem);
         if (hotbar.type != StepType.READY) {
             return hotbar;
         }
 
-        if (closeOpenGui("Closing GUI", "Preparing to place crafting table")) {
+        if (closeOpenGui("Closing GUI", "Preparing to place " + shortName(placeItem))) {
             return Step.pause();
         }
 
-        Optional<BlockPos> placement = findCraftingTablePlacement();
+        Optional<BlockPos> placement = findWorkstationPlacement();
         if (placement.isEmpty()) {
             status = "Blocked";
-            focus = "No safe crafting-table placement";
-            return Step.unsupported("no safe nearby position for a crafting table");
+            focus = "No safe placement for " + shortName(placeItem);
+            return Step.unsupported("no safe nearby position for a " + shortName(placeItem));
         }
 
-        BlockState[][][] states = new BlockState[][][]{{{Blocks.CRAFTING_TABLE.defaultBlockState()}}};
-        craftingTablePos = placement.get();
-        subAction = SubAction.BUILDING_CRAFTING_TABLE;
-        baritone.getBuilderProcess().build("crafting table", new StaticSchematic(states), craftingTablePos);
-        status = "Placing crafting table";
-        focus = formatPos(craftingTablePos);
+        workstationBlock = block;
+        workstationPos = placement.get();
+        workstationOpenAttempts = 0;
+        subAction = SubAction.BUILDING_WORKSTATION;
+        baritone.getBuilderProcess().build(shortName(placeItem), workstationSchematic(block), workstationPos);
+        status = "Placing " + shortName(placeItem);
+        focus = formatPos(workstationPos);
         return Step.defer();
     }
 
-    private Step openCraftingTable() {
-        status = "Opening crafting table";
-        focus = craftingTablePos == null ? "Finding table" : formatPos(craftingTablePos);
-        if (ctx.player().containerMenu instanceof CraftingMenu) {
+    private StaticSchematic workstationSchematic(Block block) {
+        BlockState[][][] states = new BlockState[][][]{{{block.defaultBlockState()}}};
+        return new StaticSchematic(states) {
+            @Override
+            public BlockState desiredState(int x, int y, int z, BlockState current, List<BlockState> approxPlaceable) {
+                if (current.getBlock() == block) {
+                    return current;
+                }
+                for (BlockState placeable : approxPlaceable) {
+                    if (placeable.getBlock() == block) {
+                        return placeable;
+                    }
+                }
+                return block.defaultBlockState();
+            }
+        };
+    }
+
+    private Step openWorkstation(Block block) {
+        status = "Opening " + shortName(block.asItem());
+        focus = workstationPos == null ? "Finding block" : formatPos(workstationPos);
+        if (isWorkstationOpen(block)) {
+            workstationOpenAttempts = 0;
             clearSubAction();
             return Step.ready();
         }
-        if (closeOpenGui("Closing GUI", "Preparing to open crafting table")) {
+        if (closeOpenGui("Closing GUI", "Preparing to open " + shortName(block.asItem()))) {
             return Step.pause();
         }
-        subAction = SubAction.OPENING_CRAFTING_TABLE;
-        baritone.getGetToBlockProcess().getToBlock(new BlockOptionalMeta(Blocks.CRAFTING_TABLE));
+        workstationBlock = block;
+        workstationOpenAttempts++;
+        subAction = SubAction.OPENING_WORKSTATION;
+        baritone.getGetToBlockProcess().getToBlock(new BlockOptionalMeta(block));
         return Step.defer();
+    }
+
+    private boolean isWorkstationOpen(Block block) {
+        AbstractContainerMenu menu = ctx.player().containerMenu;
+        if (block == Blocks.CRAFTING_TABLE) {
+            return menu instanceof CraftingMenu;
+        }
+        if (block == Blocks.FURNACE) {
+            return menu instanceof FurnaceMenu;
+        }
+        return false;
     }
 
     private Step ensureMined(Item item, int desired, Set<Item> visiting) {
@@ -409,10 +459,146 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
 
         miningItem = item;
         subAction = SubAction.MINING;
-        baritone.getMineProcess().mine(desired, sources.toArray(new Block[0]));
+        baritone.getMineProcess().mine(batchedMineTarget(item, desired), sources.toArray(new Block[0]));
         status = "Mining";
         focus = shortName(item) + " from " + summarizeBlocks(sources);
         return Step.defer();
+    }
+
+    /**
+     * How many of {@code item} the mine process should gather in one trip: enough for the immediate recipe
+     * ({@code desired}) but ideally enough for the entire remaining job, so we don't walk back to the same
+     * ore/tree once per sub-recipe. Falls back to {@code desired} if the estimate fails.
+     */
+    private int batchedMineTarget(Item item, int desired) {
+        int extra;
+        try {
+            extra = gatherNeeds().getOrDefault(item, 0);
+        } catch (RuntimeException ignored) {
+            extra = 0;
+        }
+        // gatherNeeds() already subtracts current inventory, so target = what we hold + what is still needed.
+        int target = Math.max(desired, count(item) + Math.min(extra, 1024));
+        return target;
+    }
+
+    /**
+     * A bill of materials for the active target: how many of each base resource (mined/picked-up item) must
+     * still be gathered, accounting for current inventory, recipe yields, the tools required to mine ores,
+     * and the crafting table / furnace that crafting and smelting need.
+     */
+    private Map<Item, Integer> gatherNeeds() {
+        Map<Item, Integer> gather = new HashMap<>();
+        if (target == null || ctx.world() == null) {
+            return gather;
+        }
+        expand(target, quantity, gather, inventorySnapshot(), new HashSet<>());
+        return gather;
+    }
+
+    private Map<Item, Integer> inventorySnapshot() {
+        Map<Item, Integer> snapshot = new HashMap<>();
+        for (ItemStack stack : ctx.player().getInventory().items) {
+            if (!stack.isEmpty()) {
+                snapshot.merge(stack.getItem(), stack.getCount(), Integer::sum);
+            }
+        }
+        for (ItemStack stack : ctx.player().getInventory().offhand) {
+            if (!stack.isEmpty()) {
+                snapshot.merge(stack.getItem(), stack.getCount(), Integer::sum);
+            }
+        }
+        return snapshot;
+    }
+
+    private void expand(Item item, int qty, Map<Item, Integer> gather, Map<Item, Integer> available, Set<Item> visiting) {
+        int have = available.getOrDefault(item, 0);
+        int use = Math.min(have, qty);
+        if (use > 0) {
+            available.put(item, have - use);
+        }
+        int remaining = qty - use;
+        if (remaining <= 0) {
+            return;
+        }
+        if (visiting.size() >= MAX_RECIPE_DEPTH || !visiting.add(item)) {
+            gather.merge(item, remaining, Integer::sum);
+            return;
+        }
+        try {
+            Optional<CraftingRecipe> recipe = findBestRecipe(item, visiting);
+            if (recipe.isPresent()) {
+                CraftingRecipe craftingRecipe = recipe.get();
+                int yield = Math.max(1, craftingRecipe.getResultItem(ctx.world().registryAccess()).getCount());
+                int crafts = (remaining + yield - 1) / yield;
+                if (!craftingRecipe.canCraftInDimensions(2, 2)) {
+                    planWorkstation(Blocks.CRAFTING_TABLE, Items.CRAFTING_TABLE, gather, available, visiting);
+                }
+                for (Map.Entry<Item, Integer> requirement : selectRequirements(craftingRecipe).entrySet()) {
+                    expand(requirement.getKey(), requirement.getValue() * crafts, gather, available, visiting);
+                }
+                // Surplus from rounding crafts up can satisfy other needs for the same item.
+                available.merge(item, crafts * yield - remaining, Integer::sum);
+                return;
+            }
+            Optional<SmeltingRecipe> smelting = findBestSmeltingRecipe(item, visiting);
+            if (smelting.isPresent()) {
+                planWorkstation(Blocks.FURNACE, Items.FURNACE, gather, available, visiting);
+                Item input = firstSmeltInput(smelting.get());
+                if (input != null) {
+                    expand(input, remaining, gather, available, visiting);
+                }
+                Item fuel = chooseFuel(visiting);
+                if (fuel != null) {
+                    int perFuel = Math.max(1, AbstractFurnaceBlockEntity.getFuel().getOrDefault(fuel, 0) / 200);
+                    expand(fuel, (remaining + perFuel - 1) / perFuel, gather, available, visiting);
+                }
+                return;
+            }
+            planMiningTool(item, gather, available, visiting);
+            gather.merge(item, remaining, Integer::sum);
+        } finally {
+            visiting.remove(item);
+        }
+    }
+
+    private void planWorkstation(Block block, Item blockItem, Map<Item, Integer> gather, Map<Item, Integer> available, Set<Item> visiting) {
+        if (available.getOrDefault(blockItem, 0) > 0) {
+            return;
+        }
+        if (isWorkstationOpen(block) || findNearbyWorkstation(block).isPresent()) {
+            available.merge(blockItem, 1, Integer::sum);
+            return;
+        }
+        expand(blockItem, 1, gather, available, visiting);
+        available.merge(blockItem, 1, Integer::sum);
+    }
+
+    private void planMiningTool(Item item, Map<Item, Integer> gather, Map<Item, Integer> available, Set<Item> visiting) {
+        Item tool = requiredMiningToolType(item);
+        if (tool == null || available.getOrDefault(tool, 0) > 0) {
+            return;
+        }
+        expand(tool, 1, gather, available, visiting);
+        available.merge(tool, 1, Integer::sum);
+    }
+
+    private Item requiredMiningToolType(Item item) {
+        Item best = null;
+        for (Block source : mineSources(item)) {
+            BlockState state = source.defaultBlockState();
+            if (!state.requiresCorrectToolForDrops() || findCorrectToolSlot(state, 0, 36) != -1) {
+                return null; // a source is mineable bare-handed, or we already hold a correct tool
+            }
+            Item minimum = minimumToolFor(state);
+            if (minimum == null) {
+                continue;
+            }
+            if (best == null || toolTier(minimum) < toolTier(best)) {
+                best = minimum;
+            }
+        }
+        return best;
     }
 
     private PathingCommand tickCraftAction(boolean isSafeToCancel) {
@@ -487,16 +673,344 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
         return menu instanceof InventoryMenu && recipe.canCraftInDimensions(2, 2);
     }
 
-    private Optional<CraftingRecipe> findBestRecipe(Item item) {
+    private PathingCommand tickSmeltAction(boolean isSafeToCancel) {
+        status = "Smelting";
+        focus = shortName(smeltAction.item) + " " + count(smeltAction.item) + "/" + smeltAction.desired;
+        if (!isSafeToCancel) {
+            focus = "Waiting for safe pause";
+            return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
+        }
+
+        AbstractContainerMenu menu = ctx.player().containerMenu;
+        if (!(menu instanceof FurnaceMenu)) {
+            // The furnace GUI closed unexpectedly; let planning reopen it.
+            smeltAction = null;
+            return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
+        }
+
+        if (smeltAction.cooldown-- > 0) {
+            return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
+        }
+
+        // Pull finished results out of the furnace first so they count toward the goal.
+        if (menu.getSlot(2).hasItem()) {
+            ctx.playerController().windowClick(menu.containerId, 2, 0, ClickType.QUICK_MOVE, ctx.player());
+            smeltAction.cooldown = 2;
+            smeltAction.attempts = 0;
+            return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
+        }
+
+        if (count(smeltAction.item) >= smeltAction.desired) {
+            status = "Smelted";
+            focus = shortName(smeltAction.item) + " " + count(smeltAction.item) + "/" + quantity;
+            smeltAction = null;
+            return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
+        }
+
+        boolean loaded = false;
+        if (!menu.getSlot(1).hasItem() && count(smeltAction.fuel) > 0 && moveToFurnace(menu, smeltAction.fuel)) {
+            loaded = true;
+        }
+        if (!menu.getSlot(0).hasItem() && count(smeltAction.input) > 0 && moveToFurnace(menu, smeltAction.input)) {
+            loaded = true;
+        }
+        if (loaded) {
+            smeltAction.cooldown = 2;
+            smeltAction.attempts = 0;
+            return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
+        }
+
+        // Something is still cooking in the input slot; wait for it.
+        if (menu.getSlot(0).hasItem()) {
+            smeltAction.attempts = 0;
+            return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
+        }
+
+        // Nothing left to load and nothing cooking: we cannot reach the goal anymore.
+        if (count(smeltAction.input) <= 0) {
+            status = "Smelting stalled";
+            focus = shortName(smeltAction.item);
+            logDirect("Smelting stopped before enough " + name(smeltAction.item) + " was produced (out of " + name(smeltAction.input) + ")");
+            smeltAction = null;
+            return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
+        }
+
+        if (++smeltAction.attempts > 20) {
+            status = "Smelting stalled";
+            focus = shortName(smeltAction.item);
+            logDirect("Unable to make progress smelting " + name(smeltAction.item));
+            smeltAction = null;
+        }
+        return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
+    }
+
+    private boolean moveToFurnace(AbstractContainerMenu menu, Item item) {
+        // Furnace slots 0 (input), 1 (fuel) and 2 (result) precede the player inventory slots.
+        for (int i = 3; i < menu.slots.size(); i++) {
+            if (menu.getSlot(i).getItem().is(item)) {
+                ctx.playerController().windowClick(menu.containerId, i, 0, ClickType.QUICK_MOVE, ctx.player());
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private Optional<CraftingRecipe> findBestRecipe(Item item, Set<Item> visiting) {
+        return craftingRecipesFor(item)
+                .stream()
+                .filter(recipe -> !isDecompressionRecipe(item, recipe))
+                .filter(recipe -> isRecipeObtainable(recipe, visiting))
+                .min(Comparator.comparingInt(this::scoreRecipe));
+    }
+
+    /**
+     * Whether {@code recipe} just unpacks a storage block into many copies of {@code item}
+     * (e.g. iron_block -> 9 iron_ingot, raw_iron_block -> 9 raw_iron). Such recipes are the reverse of a
+     * compression recipe and only create cycles when we are trying to obtain the small item, so we skip
+     * them unless the storage block is already on hand.
+     */
+    private boolean isDecompressionRecipe(Item item, CraftingRecipe recipe) {
+        Level world = ctx.world();
+        if (world == null || recipe.getResultItem(world.registryAccess()).getCount() <= 1) {
+            return false;
+        }
+        Map<Item, Integer> requirements = selectRequirements(recipe);
+        if (requirements.size() != 1) {
+            return false;
+        }
+        Map.Entry<Item, Integer> only = requirements.entrySet().iterator().next();
+        Item block = only.getKey();
+        if (only.getValue() != 1 || count(block) > 0) {
+            return false;
+        }
+        for (CraftingRecipe reverse : craftingRecipesFor(block)) {
+            if (selectRequirements(reverse).containsKey(item)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private List<CraftingRecipe> craftingRecipesFor(Item item) {
         Level world = ctx.world();
         if (world == null) {
-            return Optional.empty();
+            return List.of();
         }
         return world.getRecipeManager().getAllRecipesFor(RecipeType.CRAFTING)
                 .stream()
                 .filter(recipe -> recipe.getResultItem(world.registryAccess()).is(item))
                 .filter(recipe -> !recipe.isSpecial())
-                .min(Comparator.comparingInt(this::scoreRecipe));
+                .toList();
+    }
+
+    private List<SmeltingRecipe> smeltingRecipesFor(Item item) {
+        Level world = ctx.world();
+        if (world == null) {
+            return List.of();
+        }
+        return world.getRecipeManager().getAllRecipesFor(RecipeType.SMELTING)
+                .stream()
+                .filter(recipe -> recipe.getResultItem(world.registryAccess()).is(item))
+                .toList();
+    }
+
+    private Optional<SmeltingRecipe> findBestSmeltingRecipe(Item item, Set<Item> visiting) {
+        return smeltingRecipesFor(item)
+                .stream()
+                .filter(recipe -> {
+                    Item input = firstSmeltInput(recipe);
+                    return input != null && canObtain(input, visiting);
+                })
+                .min(Comparator.comparingInt(this::scoreSmeltingRecipe));
+    }
+
+    private int scoreSmeltingRecipe(SmeltingRecipe recipe) {
+        Item input = firstSmeltInput(recipe);
+        if (input == null) {
+            return Integer.MAX_VALUE;
+        }
+        if (count(input) > 0) {
+            return 0;
+        }
+        if (matchingDroppedItemCount(input) > 0) {
+            return 1;
+        }
+        // Prefer an input that a block actually drops when mined (e.g. raw_iron from iron_ore)
+        // over one only reachable by silk-touching the ore block itself (the iron_ore item).
+        if (hasMineDropSource(input)) {
+            return 2;
+        }
+        if (!craftingRecipesFor(input).isEmpty()) {
+            return 3;
+        }
+        return 5;
+    }
+
+    private boolean hasMineDropSource(Item item) {
+        return mineDropSourceCache.computeIfAbsent(item, this::computeHasMineDropSource);
+    }
+
+    private boolean computeHasMineDropSource(Item item) {
+        ItemStack target = new ItemStack(item);
+        for (Block block : BuiltInRegistries.BLOCK) {
+            if (block == Blocks.AIR) {
+                continue;
+            }
+            try {
+                if (new BlockOptionalMeta(block).matches(target)) {
+                    return true;
+                }
+            } catch (RuntimeException ignored) {
+                // Some modded loot tables can be unavailable client-side; skip them instead of failing #get.
+            }
+        }
+        return false;
+    }
+
+    private Item firstSmeltInput(SmeltingRecipe recipe) {
+        if (recipe.getIngredients().isEmpty()) {
+            return null;
+        }
+        Ingredient ingredient = recipe.getIngredients().get(0);
+        if (ingredient.isEmpty()) {
+            return null;
+        }
+        return chooseIngredientItem(ingredient, new HashMap<>());
+    }
+
+    private boolean isRecipeObtainable(CraftingRecipe recipe, Set<Item> visiting) {
+        Map<Item, Integer> requirements = selectRequirements(recipe);
+        if (requirements.isEmpty()) {
+            return false;
+        }
+        for (Item requirement : requirements.keySet()) {
+            // An ingredient that is already being resolved would be a recipe cycle
+            // (e.g. iron_ingot crafted from iron_block while resolving iron_block).
+            if (visiting.contains(requirement) || !canObtain(requirement, visiting)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Whether {@code item} can ultimately be obtained from the current world/inventory without revisiting an item
+     * already being resolved (which would be a recipe cycle, e.g. iron_block -> iron_ingot -> iron_block).
+     */
+    private boolean canObtain(Item item, Set<Item> chain) {
+        if (count(item) > 0) {
+            return true;
+        }
+        if (matchingDroppedItemCount(item) > 0 && hasInventorySpaceFor(item)) {
+            return true;
+        }
+        if (!mineSources(item).isEmpty()) {
+            return true;
+        }
+        if (chain.size() >= MAX_RECIPE_DEPTH || !chain.add(item)) {
+            return false;
+        }
+        boolean obtainable = false;
+        for (SmeltingRecipe recipe : smeltingRecipesFor(item)) {
+            Item input = firstSmeltInput(recipe);
+            if (input != null && !chain.contains(input) && canObtain(input, chain)) {
+                obtainable = true;
+                break;
+            }
+        }
+        if (!obtainable) {
+            for (CraftingRecipe recipe : craftingRecipesFor(item)) {
+                if (isDecompressionRecipe(item, recipe)) {
+                    continue;
+                }
+                Map<Item, Integer> requirements = selectRequirements(recipe);
+                if (requirements.isEmpty()) {
+                    continue;
+                }
+                boolean all = true;
+                for (Item requirement : requirements.keySet()) {
+                    if (chain.contains(requirement) || !canObtain(requirement, chain)) {
+                        all = false;
+                        break;
+                    }
+                }
+                if (all) {
+                    obtainable = true;
+                    break;
+                }
+            }
+        }
+        chain.remove(item);
+        return obtainable;
+    }
+
+    private Step planSmelt(Item item, int desired, SmeltingRecipe recipe, Set<Item> visiting) {
+        status = "Planning smelt";
+        focus = shortName(item) + " by smelting";
+        Item input = firstSmeltInput(recipe);
+        if (input == null) {
+            return Step.unsupported("smelting recipe has no usable input");
+        }
+
+        int needed = Math.max(1, desired - count(item));
+
+        Step inputStep = ensureItem(input, needed, visiting);
+        if (inputStep.type != StepType.READY) {
+            return inputStep;
+        }
+
+        Item fuel = chooseFuel(visiting);
+        if (fuel == null) {
+            return Step.unsupported("no usable fuel is available for smelting");
+        }
+        int perFuel = Math.max(1, AbstractFurnaceBlockEntity.getFuel().getOrDefault(fuel, 0) / 200);
+        int fuelNeeded = Math.max(1, (needed + perFuel - 1) / perFuel);
+        Step fuelStep = ensureItem(fuel, fuelNeeded, visiting);
+        if (fuelStep.type != StepType.READY) {
+            return fuelStep;
+        }
+
+        Step furnace = ensureWorkstation(Blocks.FURNACE, Items.FURNACE, visiting);
+        if (furnace.type != StepType.READY) {
+            return furnace;
+        }
+
+        smeltAction = new SmeltAction(item, input, fuel, desired);
+        status = "Smelting queued";
+        focus = shortName(item) + " from " + shortName(input);
+        return Step.pause();
+    }
+
+    private Item chooseFuel(Set<Item> visiting) {
+        Map<Item, Integer> fuels = AbstractFurnaceBlockEntity.getFuel();
+        if (count(Items.COAL) > 0) {
+            return Items.COAL;
+        }
+        if (count(Items.CHARCOAL) > 0) {
+            return Items.CHARCOAL;
+        }
+        for (Item fuel : fuels.keySet()) {
+            if (isReasonableFuel(fuel) && count(fuel) > 0) {
+                return fuel;
+            }
+        }
+        if (fuels.containsKey(Items.COAL) && canObtain(Items.COAL, visiting)) {
+            return Items.COAL;
+        }
+        if (fuels.containsKey(Items.CHARCOAL) && canObtain(Items.CHARCOAL, visiting)) {
+            return Items.CHARCOAL;
+        }
+        for (Item fuel : fuels.keySet()) {
+            if (isReasonableFuel(fuel) && canObtain(fuel, visiting)) {
+                return fuel;
+            }
+        }
+        return null;
+    }
+
+    private boolean isReasonableFuel(Item fuel) {
+        // Avoid consuming a bucket of lava as a one-off fuel when cheaper options exist.
+        return fuel != Items.LAVA_BUCKET;
     }
 
     private int scoreRecipe(CraftingRecipe recipe) {
@@ -583,32 +1097,111 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
     }
 
     private Item chooseWoodIngredient(Ingredient ingredient) {
-        for (WoodOption option : WOOD_OPTIONS) {
-            if (ingredient.test(new ItemStack(option.planks)) && count(option.logItem) > 0) {
+        List<WoodOption> options = woodOptions();
+        // Already hold a log whose planks satisfy the ingredient: turn that log into planks.
+        for (WoodOption option : options) {
+            if (count(option.logItem) > 0 && ingredient.test(new ItemStack(option.planks))) {
                 return option.planks;
             }
         }
-        for (WoodOption option : WOOD_OPTIONS) {
-            if (ingredient.test(new ItemStack(option.logItem)) && hasNearbyBlock(option.logBlock, 24, 12)) {
-                return option.logItem;
-            }
+        // Chop the closest matching tree, not just the first wood type that happens to be in range.
+        WoodOption nearest = findNearestWood(options, ingredient);
+        if (nearest != null) {
+            // Use the log directly if the recipe wants a log; otherwise craft planks from it.
+            return ingredient.test(new ItemStack(nearest.logItem)) ? nearest.logItem : nearest.planks;
         }
-        for (WoodOption option : WOOD_OPTIONS) {
-            if (ingredient.test(new ItemStack(option.planks)) && hasNearbyBlock(option.logBlock, 24, 12)) {
-                return option.planks;
-            }
-        }
-        for (WoodOption option : WOOD_OPTIONS) {
+        // Nothing nearby; fall back to any accepted planks, then any accepted log.
+        for (WoodOption option : options) {
             if (ingredient.test(new ItemStack(option.planks))) {
                 return option.planks;
             }
         }
-        for (WoodOption option : WOOD_OPTIONS) {
+        for (WoodOption option : options) {
             if (ingredient.test(new ItemStack(option.logItem))) {
                 return option.logItem;
             }
         }
         return null;
+    }
+
+    private WoodOption findNearestWood(List<WoodOption> options, Ingredient ingredient) {
+        // Map every log block whose log or planks the ingredient accepts back to its wood option,
+        // then sweep the area once and keep the closest hit.
+        Map<Block, WoodOption> byBlock = new HashMap<>();
+        for (WoodOption option : options) {
+            if (ingredient.test(new ItemStack(option.logItem)) || ingredient.test(new ItemStack(option.planks))) {
+                byBlock.putIfAbsent(option.logBlock, option);
+            }
+        }
+        if (byBlock.isEmpty()) {
+            return null;
+        }
+        BlockPos feet = ctx.playerFeet();
+        WoodOption best = null;
+        double bestDistSq = Double.MAX_VALUE;
+        for (int dx = -24; dx <= 24; dx++) {
+            for (int dy = -12; dy <= 12; dy++) {
+                for (int dz = -24; dz <= 24; dz++) {
+                    BlockPos pos = feet.offset(dx, dy, dz);
+                    WoodOption option = byBlock.get(ctx.world().getBlockState(pos).getBlock());
+                    if (option == null) {
+                        continue;
+                    }
+                    double distSq = feet.distSqr(pos);
+                    if (distSq < bestDistSq) {
+                        bestDistSq = distSq;
+                        best = option;
+                    }
+                }
+            }
+        }
+        return best;
+    }
+
+    /**
+     * All planks -> log mappings known to the current world, derived from the loaded recipes instead of a
+     * hardcoded list. This automatically covers every wood/stem type (including stripped and "wood"/"hyphae"
+     * variants, nether stems and pale oak) as well as any modded woods, and stays correct across versions.
+     */
+    private List<WoodOption> woodOptions() {
+        if (cachedWoodOptions != null) {
+            return cachedWoodOptions;
+        }
+        Level world = ctx.world();
+        if (world == null) {
+            return List.of();
+        }
+        List<WoodOption> options = new ArrayList<>();
+        for (CraftingRecipe recipe : world.getRecipeManager().getAllRecipesFor(RecipeType.CRAFTING)) {
+            if (recipe.isSpecial()) {
+                continue;
+            }
+            ItemStack result = recipe.getResultItem(world.registryAccess());
+            if (!result.is(ItemTags.PLANKS)) {
+                continue;
+            }
+            Ingredient logIngredient = null;
+            int nonEmpty = 0;
+            for (Ingredient ingredient : recipe.getIngredients()) {
+                if (ingredient.isEmpty()) {
+                    continue;
+                }
+                nonEmpty++;
+                logIngredient = ingredient;
+            }
+            if (nonEmpty != 1) {
+                continue;
+            }
+            for (ItemStack logStack : logIngredient.getItems()) {
+                Item logItem = logStack.getItem();
+                Block logBlock = Block.byItem(logItem);
+                if (logBlock != Blocks.AIR) {
+                    options.add(new WoodOption(result.getItem(), logItem, logBlock));
+                }
+            }
+        }
+        cachedWoodOptions = options;
+        return options;
     }
 
     private List<Block> mineSources(Item item) {
@@ -618,12 +1211,15 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
     private List<Block> findMineSources(Item item) {
         ItemStack target = new ItemStack(item);
         List<Block> result = new ArrayList<>();
+        if (item == Items.COBBLESTONE) {
+            result.add(Blocks.STONE);
+        }
         Block direct = Block.byItem(item);
-        if (direct != Blocks.AIR) {
+        if (direct != Blocks.AIR && !skipMineSource(item, direct)) {
             result.add(direct);
         }
         BuiltInRegistries.BLOCK.forEach(block -> {
-            if (block == Blocks.AIR || result.contains(block)) {
+            if (block == Blocks.AIR || result.contains(block) || skipMineSource(item, block)) {
                 return;
             }
             try {
@@ -635,6 +1231,10 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
             }
         });
         return result;
+    }
+
+    private boolean skipMineSource(Item item, Block block) {
+        return item == Items.COBBLESTONE && block == Blocks.COBBLESTONE;
     }
 
     private Step ensureMiningTool(Item item, List<Block> sources, Set<Item> visiting) {
@@ -822,20 +1422,20 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
         return -1;
     }
 
-    private Optional<BlockPos> findNearbyCraftingTable() {
+    private Optional<BlockPos> findNearbyWorkstation(Block block) {
         BlockPos feet = ctx.playerFeet();
-        List<BlockPos> tables = new ArrayList<>();
+        List<BlockPos> found = new ArrayList<>();
         for (int dx = -CRAFTING_TABLE_SCAN_HORIZONTAL; dx <= CRAFTING_TABLE_SCAN_HORIZONTAL; dx++) {
             for (int dy = -CRAFTING_TABLE_SCAN_VERTICAL; dy <= CRAFTING_TABLE_SCAN_VERTICAL; dy++) {
                 for (int dz = -CRAFTING_TABLE_SCAN_HORIZONTAL; dz <= CRAFTING_TABLE_SCAN_HORIZONTAL; dz++) {
                     BlockPos pos = feet.offset(dx, dy, dz);
-                    if (ctx.world().getBlockState(pos).getBlock() == Blocks.CRAFTING_TABLE) {
-                        tables.add(pos);
+                    if (ctx.world().getBlockState(pos).getBlock() == block) {
+                        found.add(pos);
                     }
                 }
             }
         }
-        return tables.stream().min(Comparator.comparingDouble(feet::distSqr));
+        return found.stream().min(Comparator.comparingDouble(feet::distSqr));
     }
 
     private boolean hasNearbyBlock(Block block, int horizontalRange, int verticalRange) {
@@ -852,7 +1452,7 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
         return false;
     }
 
-    private Optional<BlockPos> findCraftingTablePlacement() {
+    private Optional<BlockPos> findWorkstationPlacement() {
         BlockPos feet = ctx.playerFeet();
         AABB playerBox = ctx.player().getBoundingBox().inflate(0.05);
         List<BlockPos> positions = new ArrayList<>();
@@ -863,7 +1463,7 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
                         continue;
                     }
                     BlockPos pos = feet.offset(dx, 0, dz);
-                    if (canPlaceCraftingTableAt(pos, playerBox)) {
+                    if (canPlaceWorkstationAt(pos, playerBox)) {
                         positions.add(pos);
                     }
                 }
@@ -875,7 +1475,7 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
         return positions.stream().min(Comparator.comparingDouble(feet::distSqr));
     }
 
-    private boolean canPlaceCraftingTableAt(BlockPos pos, AABB playerBox) {
+    private boolean canPlaceWorkstationAt(BlockPos pos, AABB playerBox) {
         BlockState current = ctx.world().getBlockState(pos);
         BlockState support = ctx.world().getBlockState(pos.below());
         return current.canBeReplaced()
@@ -941,12 +1541,15 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
         this.target = next.item;
         this.quantity = next.quantity;
         this.craftAction = null;
+        this.smeltAction = null;
         this.subAction = SubAction.NONE;
         this.miningItem = null;
         this.pickupItem = null;
         this.pickupDesired = 0;
         this.pickupTicks = 0;
-        this.craftingTablePos = null;
+        this.workstationBlock = null;
+        this.workstationPos = null;
+        this.workstationOpenAttempts = 0;
         this.status = "Starting";
         this.focus = shortName(next.item);
     }
@@ -955,12 +1558,15 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
         logDirect("Have " + quantity + " " + name(target));
         cancelDelegatedProcesses();
         craftAction = null;
+        smeltAction = null;
         subAction = SubAction.NONE;
         miningItem = null;
         pickupItem = null;
         pickupDesired = 0;
         pickupTicks = 0;
-        craftingTablePos = null;
+        workstationBlock = null;
+        workstationPos = null;
+        workstationOpenAttempts = 0;
         int nextIndex = nextUnsatisfiedTargetIndex(targetIndex + 1);
         if (nextIndex == -1) {
             status = "Finished";
@@ -1029,12 +1635,15 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
         target = null;
         quantity = 0;
         craftAction = null;
+        smeltAction = null;
         subAction = SubAction.NONE;
         miningItem = null;
         pickupItem = null;
         pickupDesired = 0;
         pickupTicks = 0;
-        craftingTablePos = null;
+        workstationBlock = null;
+        workstationPos = null;
+        workstationOpenAttempts = 0;
         status = "Idle";
         focus = "";
         cancelDelegatedProcesses();
@@ -1127,8 +1736,8 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
         NONE,
         PICKING_UP,
         MINING,
-        BUILDING_CRAFTING_TABLE,
-        OPENING_CRAFTING_TABLE
+        BUILDING_WORKSTATION,
+        OPENING_WORKSTATION
     }
 
     private enum CraftStage {
@@ -1149,6 +1758,22 @@ public final class GetProcess extends BaritoneProcessHelper implements IGetProce
             this.recipe = recipe;
             this.item = item;
             this.previousCount = previousCount;
+        }
+    }
+
+    private static final class SmeltAction {
+        private final Item item;
+        private final Item input;
+        private final Item fuel;
+        private final int desired;
+        private int cooldown;
+        private int attempts;
+
+        private SmeltAction(Item item, Item input, Item fuel, int desired) {
+            this.item = item;
+            this.input = input;
+            this.fuel = fuel;
+            this.desired = desired;
         }
     }
 
