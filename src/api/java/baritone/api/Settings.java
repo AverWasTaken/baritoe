@@ -702,6 +702,11 @@ public final class Settings {
     public final Setting<Boolean> renderPath = new Setting<>(true);
 
     /**
+     * Render the native get-process status HUD in the top-left corner
+     */
+    public final Setting<Boolean> renderGetProcessHud = new Setting<>(true);
+
+    /**
      * Render the path as a line instead of a frickin thingy
      */
     public final Setting<Boolean> renderPathAsLine = new Setting<>(false);

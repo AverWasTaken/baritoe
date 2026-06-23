@@ -59,6 +59,12 @@ public interface IBaritone {
     IMineProcess getMineProcess();
 
     /**
+     * @return The {@link IGetProcess} instance
+     * @see IGetProcess
+     */
+    IGetProcess getGetProcess();
+
+    /**
      * @return The {@link IBuilderProcess} instance
      * @see IBuilderProcess
      */
